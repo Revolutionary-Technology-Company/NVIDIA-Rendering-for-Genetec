@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  # 1. CENTRAL MESSAGE HUB (Telemetry Router)
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: security_mqtt_broker
+    ports:
+      - "1883:1883"
+    volumes:
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    restart: unless-stopped
+
+  # 2. LOCAL TRACKING DASHBOARD (UI Room Interface)
+  analytics-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    container_name: security_streamlit_ui
+    entrypoint: ["streamlit", "run", "dashboard.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports:
+      - "8501:8501"
+    depends_on:
+      - mqtt-broker
+    restart: unless-stopped
+
+  # 3. EDGE DEEPESTREAM EDGE ENGINE (DOCKER INFERENCE TOGGLE)
+  # Un-comment or set command arguments depending on which host hardware room you deploy to.
+  camera-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    container_name: security_deepstream_core
+    network_mode: "host" # Eliminates network bridge overhead for high-bitrate 4K Genetec streams
+    depends_on:
+      - mqtt-broker
+    volumes:
+      - ./triton_model_repo:/app/triton_model_repo
+    # --- HARDWARE DEPLOYMENT SWITCH ---
+    command: ["--gpu-type", "rtx6000"] # Toggle to "rtx50" for your ASUS TUF Blackwell nodes
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, utility]
+    restart: unless-stopped
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:
