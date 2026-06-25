@@ -1,0 +1,9 @@
+[property]
+gpu-id=0
+net-scale-factor=0.003921569790691137
+model-engine-file=yolov8x_ada_6000.engine
+infer-dims=3;2160;3840
+num-detected-classes=80
+interval=0
+gie-unique-id=1
+network-mode=1 # Native FP16 precision
