@@ -114,39 +114,52 @@ def nms_fastmath_jit(boxes, scores, iou_threshold):
 @njit(fastmath=True, parallel=True, cache=True)
 def evaluate_threat_proximity_jit(boxes, class_ids, object_ids):
     """
-    Compiled JIT Function: Scans thousands of coordinate points across 
-    multi-core threads simultaneously.
-    Maps weapons directly to the nearest tracked individual.
+    Advanced JIT Distance-Aware Proximity Engine.
+    Dynamically scales the weapon validation radius based on estimated 
+    person-to-camera depth metrics to maximize sensitivity at a distance.
     """
     num_objects = len(class_ids)
-    # Array mapping threat indices: -1 means no weapon associated
     weapon_owner_ids = np.full(num_objects, -1, dtype=np.int32)
     
-    # Nested parallel loop searching for Class 3 (Weapons) vs Class 0 (People)
     for i in prange(num_objects):
-        if class_ids[i] == 3:  # Found a weapon box
+        if class_ids[i] == 3:  # Target: Weapon detected
             w_x1, w_y1, w_x2, w_y2 = boxes[i]
             w_cx = w_x1 + (w_x2 - w_x1) / 2.0
             w_cy = w_y1 + (w_y2 - w_y1) / 2.0
             
             min_distance = 999999.0
             closest_person_idx = -1
+            adaptive_threshold = 300.0  # Default baseline radius for close range
             
             for j in range(num_objects):
-                if class_ids[j] == 0:  # Found a person box
+                if class_ids[j] == 0:  # Target: Person / Staff
                     p_x1, p_y1, p_x2, p_y2 = boxes[j]
-                    p_cx = p_x1 + (p_x2 - p_x1) / 2.0
-                    p_cy = p_y1 + (p_y2 - p_y1) / 2.0
+                    p_w = p_x2 - p_x1
+                    p_h = p_y2 - p_y1
+                    p_cx = p_x1 + (p_w / 2.0)
+                    p_cy = p_y1 + (p_h / 2.0)
                     
-                    # Euclidean Distance calculation running at raw C-speed
+                    # Calculate distance between the weapon and person centers
                     dist = ((w_cx - p_cx) ** 2 + (w_cy - p_cy) ** 2) ** 0.5
                     
                     if dist < min_distance:
                         min_distance = dist
                         closest_person_idx = j
+                        
+                        # --- DYNAMIC DISTANCE SCALING LAW ---
+                        # In a 4K frame, a person close up might be 1000px tall. 
+                        # At 100+ feet away, they might only be 150px tall.
+                        # We scale the acceptable weapon-to-hand reach radius relative to their height.
+                        person_height = p_h
+                        if person_height < 300.0:    # Long-Distance Environment Target
+                            adaptive_threshold = person_height * 0.9  # Tighter radius to prevent false flags
+                        elif person_height < 600.0:  # Mid-Range Environment Target
+                            adaptive_threshold = person_height * 0.7
+                        else:                        # Close-Range Environment Target
+                            adaptive_threshold = 350.0
             
-            # If the weapon is within operational hand-reach proximity (e.g., 300 pixels in 4K space)
-            if min_distance < 300.0 and closest_person_idx != -1:
+            # Match threat if it falls within the dynamically adjusted environment envelope
+            if min_distance < adaptive_threshold and closest_person_idx != -1:
                 weapon_owner_ids[i] = object_ids[closest_person_idx]
                 
     return weapon_owner_ids
