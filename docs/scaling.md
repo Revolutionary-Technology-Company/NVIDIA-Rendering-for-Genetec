@@ -1,0 +1,4 @@
+When your team expands the system to support more cameras, use these adjustments based on physical hardware observations:
+
+-   **If your pipeline experiences frame stuttering or lag:** Your `max_queue_delay_microseconds` is likely set too high. Drop it from `5000` down to `2000` (2ms) to force Triton to execute inference faster, even if it has to process smaller batch sizes.
+-   **If you experience a system crash with an `Out Of Memory (OOM)` exception:** Your combination of `max_batch_size` and model instance `count` is over-allocating your GPU memory. Keep `max_batch_size: 8` but drop your instance group `count: 1` inside `config.pbtxt` to instantly reclaim VRAM space. [[1](https://www.snowflake.com/en/blog/engineering/scale-real-time-model-serving/), [2](https://github.com/triton-inference-server/server/issues/7207)]
