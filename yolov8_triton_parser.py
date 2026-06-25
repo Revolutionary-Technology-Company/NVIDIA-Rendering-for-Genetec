@@ -111,6 +111,45 @@ def nms_fastmath_jit(boxes, scores, iou_threshold):
         
     return np.array(keep, dtype=np.int32)
 
+@njit(fastmath=True, parallel=True, cache=True)
+def evaluate_threat_proximity_jit(boxes, class_ids, object_ids):
+    """
+    Compiled JIT Function: Scans thousands of coordinate points across 
+    multi-core threads simultaneously.
+    Maps weapons directly to the nearest tracked individual.
+    """
+    num_objects = len(class_ids)
+    # Array mapping threat indices: -1 means no weapon associated
+    weapon_owner_ids = np.full(num_objects, -1, dtype=np.int32)
+    
+    # Nested parallel loop searching for Class 3 (Weapons) vs Class 0 (People)
+    for i in prange(num_objects):
+        if class_ids[i] == 3:  # Found a weapon box
+            w_x1, w_y1, w_x2, w_y2 = boxes[i]
+            w_cx = w_x1 + (w_x2 - w_x1) / 2.0
+            w_cy = w_y1 + (w_y2 - w_y1) / 2.0
+            
+            min_distance = 999999.0
+            closest_person_idx = -1
+            
+            for j in range(num_objects):
+                if class_ids[j] == 0:  # Found a person box
+                    p_x1, p_y1, p_x2, p_y2 = boxes[j]
+                    p_cx = p_x1 + (p_x2 - p_x1) / 2.0
+                    p_cy = p_y1 + (p_y2 - p_y1) / 2.0
+                    
+                    # Euclidean Distance calculation running at raw C-speed
+                    dist = ((w_cx - p_cx) ** 2 + (w_cy - p_cy) ** 2) ** 0.5
+                    
+                    if dist < min_distance:
+                        min_distance = dist
+                        closest_person_idx = j
+            
+            # If the weapon is within operational hand-reach proximity (e.g., 300 pixels in 4K space)
+            if min_distance < 300.0 and closest_person_idx != -1:
+                weapon_owner_ids[i] = object_ids[closest_person_idx]
+                
+    return weapon_owner_ids
 
 def triton_output_to_objects(raw_triton_tensor, conf_thresh=0.45, iou_thresh=0.5, num_classes=80):
     """
