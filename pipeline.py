@@ -10,6 +10,7 @@ import pyds
 import yolov8_triton_parser as parser
 import ocr_layer as ocr
 import blueprint_reader as blueprint  # Import your new module
+import telemetry_producer as telemetry  # 1. IMPORT YOUR NEW TELEMETRY LAYER
 
 # System Constants
 MUXER_OUTPUT_WIDTH = 3840
@@ -59,6 +60,12 @@ def analyze_distance_metrics_jit(bbox, tracking_id, class_id):
         priority_score = area * 3.0
         
     return area, center_x, center_y, priority_score
+
+# Initialize and start the telemetry producer globally
+producer = telemetry.TelemetryProducer()
+producer.boot_client()
+
+CAMERA_IDENTIFIER = "ENGINEERING_ROOM_CAM_01"
 
 def osd_sink_pad_buffer_probe(pad, info, u_data):
     """
