@@ -254,12 +254,18 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
             for plate in captured_plates:
                 px1, py1, px2, py2 = plate['coords']
                 print(f"[LPR CAPTURE] Plate text: {plate['text']} | Accuracy: {plate['confidence']:.2f}%")
+
+                # Asynchronously transmit plate record to central tracking database via MQTT QoS 1
+                producer.send_lpr_payload(
+                    camera_id=CAMERA_IDENTIFIER,
+                    plate_text=plate['text'],
+                    confidence=plate['confidence']
+                )
                 
                 # Dynamic On-Screen Display Text Construction over the car/plate
                 txt_params = pyds.nvds_acquire_user_meta_from_pool(batch_meta)
                 display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
                 display_meta.num_labels = 1
-                
                 label = display_meta.text_params[0]
                 label.display_text = f"PLATE: {plate['text']} ({plate['confidence']*100:.0f}%)"
                 label.x_offset = px1
@@ -274,12 +280,19 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
         # --------------------------------------------------------------
         # RUN FEATURE 2: WALL BLUEPRINT STRUCTURAL READER
         # --------------------------------------------------------------
-        blueprints_read = blueprint.process_engineering_blueprint(frame_rgba, final_boxes, final_class_ids)
-        for bp in blueprints_read:
-            print(f"\n--- [BLUEPRINT READ SUCCESS: ID {bp['blueprint_id']}] ---")
-            for line in bp['data_payload']:
-                print(f" > Extracted Label: {line['text']} (Conf: {line['score']:.2f})")
-            print("--------------------------------------------------\n")
+        blueprints_read = blueprint.process_engineering_blueprint(frame_rgba, final_boxes, final_class_ids)\
+        for bp in blueprints_read:\
+        # Dispatch multi-line schema data asynchronously via MQTT QoS 0\
+        producer.send_blueprint_payload(\
+        camera_id=CAMERA_IDENTIFIER,\
+        blueprint_id=bp['blueprint_id'],\
+        extracted_data=bp['data_payload']\
+        )
+
+        # Print clean operational engine logs for Git repository verification\
+        print(f"[BLUEPRINT MATRIX SCAN] Scanned Profile ID {bp['blueprint_id']} at coords {bp['global_coords']}")\
+        for line in bp['data_payload']:\
+        print(f" > Structural Text Segment: {line['text']} (Conf: {line['score']:.2f})")
 
         # ------------------------------------------------------------------
         # FEATURE D: GENETEC METADATA DISPLAY, COLOR ENCODING & VISUALS
