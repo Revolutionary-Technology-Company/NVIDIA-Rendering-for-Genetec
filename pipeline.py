@@ -38,6 +38,7 @@ for i in range(len(boxes)):
 
 
 # --- NUMBA MULTI-CORE JIT OPTIMIZATION ---
+
 @njit(fastmath=True, cache=True)
 def analyze_distance_metrics_jit(bbox, tracking_id, class_id):
     """
@@ -76,16 +77,18 @@ LONG_DIST_HEIGHT_THRESHOLD = 300.0 # Pixels in 4K space
 CONFIRMATION_FRAMES_CLOSE = 3      # Fast alert if close up (3 frames ~0.1s)
 CONFIRMATION_FRAMES_DISTANT = 8    # More verification frames required at long-distance to kill false positives
 
+@njit(fastmath=True, cache=True)
 def osd_sink_pad_buffer_probe(pad, info, u_data):
     """
-    Unified Production Metadata Probe: Handles JIT optimization,
-    NVIDIA hardware frame access, personnel tracking, long-distance LPR,
-    and engineering room blueprint matrix evaluation simultaneously.
+    Consolidated Production Metadata Probe.
+    Handles JIT optimizations, hardware frame access, zero-copy VRAM cropping,
+    staff/weapon proximity evaluation, hysteresis, LPR text reading,
+    engineering blueprint indexing, OSD graphics, and MQTT telemetry streams.
     """
     global THREAT_HYSTERESIS_TRACKER
     gst_buffer = info.get_buffer()
     if not gst_buffer:
-        print("Unable to grab GstBuffer frame stream.")
+        print("[ERROR] Unable to grab GstBuffer frame stream layer.")
         return Gst.PadProbeReturn.OK
 
     # 1. Retrieve the native DeepStream batch metadata context
@@ -98,16 +101,35 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
         except StopIteration:
             break
 
-        # 1. Fetch JIT deep learning bounding boxes from the Triton backend
+        # ------------------------------------------------------------------
+        # FEATURE 1: ZERO-COPY GPU FRAME BUFFER SURFACE MAPPING
+        # ------------------------------------------------------------------
+        # Maps underlying hardware memory directly into Python space within VRAM.
+        # This allows PaddleOCR to run without copying frames back to CPU RAM.
+        try:
+            surface_transformer = pyds.get_nvds_Layer_Array(hash(gst_buffer), frame_meta.frame_num)
+            frame_rgba = np.array(surface_transformer, copy=False, order='C')
+        except Exception as e:
+            print(f"[SURFACE WARNING] Frame buffer mapping skipped: {str(e)}")
+            frame_rgba = None
+
+        # ------------------------------------------------------------------
+        # FEATURE 2: TENSOR EXTRACTION & MULTI-CORE JIT DECODING
+        # ------------------------------------------------------------------
+        # Fetch the raw tensor memory array emitted by Triton/nvinfer
         raw_triton_tensor = get_raw_tensor_from_meta(frame_meta) 
+        
+        # Pass the matrix into the multi-threaded Numba parser compiled with C-speed
         final_boxes, final_scores, final_class_ids = parser.triton_output_to_objects(
             raw_triton_tensor, conf_thresh=0.45, iou_thresh=0.45, num_classes=80
         )
 
-        # 2. Synchronize DeepStream Tracker Objects into local flat arrays for JIT math
+        # ------------------------------------------------------------------
+        # FEATURE 3: DEEPSTREAM TRACKER RE-ALIGNMENT FOR JIT PROXIMITY
+        # ------------------------------------------------------------------
+        # Flatten NVTracker elements into unified NumPy arrays for fast Numba evaluation
         obj_count = 0
         l_obj = frame_meta.obj_meta_list
-        # Determine active object counts
         while l_obj is not None:
             obj_count += 1
             l_obj = l_obj.next
@@ -117,7 +139,6 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
         local_ids = np.zeros(obj_count, dtype=np.int32)
         meta_references = []
 
-        # Populate arrays from the DeepStream object metadata list
         idx = 0
         l_obj = frame_meta.obj_meta_list
         while l_obj is not None:
@@ -130,74 +151,47 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
             idx += 1
             l_obj = l_obj.next
 
-        # 3. RUN WEAPON PROXIMITY EVALUATION VIA MULTI-CORE JIT
+        # ------------------------------------------------------------------
+        # FEATURE 4: ADAPTIVE WEAPON PROXIMITY & TEMPORAL VALIDATION
+        # ------------------------------------------------------------------
+        active_frame_armed_set = set()
+        
         if obj_count > 0:
+            # Execute compiled parallel spatial calculations across multiple CPU cores
             assigned_owners = parser.evaluate_threat_proximity_jit(local_boxes, local_classes, local_ids)
             
-            # 4. Apply Visual Overlays and Trigger Alerts based on Proximity Output
+            # Map tracking history state machines
             for i in range(obj_count):
                 obj_meta = meta_references[i]
                 
-                # Class 0: Personnel Tracking
-                if obj_meta.class_id == 0:
-                    obj_meta.rect_params.border_color.set(0.0, 1.0, 0.0, 1.0) # Green
-                    obj_meta.text_params.display_text = f"Person ID: {obj_meta.object_id}"
-                    
-                # Class 3: Weapon / Firearm Tracking
-                elif obj_meta.class_id == 3:
-                    # Apply a Solid Magenta/Purple alert border for visibility in the engineering room
-                    obj_meta.rect_params.border_color.set(1.0, 0.0, 1.0, 1.0) 
-                    owner_id = assigned_owners[i]
-                    
-                    if owner_id != -1:
-                        obj_meta.text_params.display_text = f"CRITICAL: Weapon Held by ID {owner_id}"
-                        # Instantly broadcast a high-priority payload over MQTT
-                        producer.client.publish(
-                            "security/analytics/threats", 
-                            json.dumps({"camera": CAMERA_IDENTIFIER, "alert": "ARMED_INDIVIDUAL", "person_id": int(owner_id)}),
-                            qos=2 # QoS 2 ensures the security station receives the message exactly once
-                        )
-                    else:
-                        obj_meta.text_params.display_text = "WARNING: Unattended Weapon Detected"
-
-        if obj_count > 0:
-            # Run the new distance-adaptive proximity math script
-            assigned_owners = parser.evaluate_threat_proximity_jit(local_boxes, local_classes, local_ids)
-            
-            # Create a set of all people confirmed armed on THIS specific frame pass
-            active_frame_armed_set = set()
-            
-            for i in range(obj_count):
-                obj_meta = meta_references[i]
-                
-                if obj_meta.class_id == 3:  # Weapon box evaluations
+                if obj_meta.class_id == 3:  # Target Class: Weapon
                     owner_id = assigned_owners[i]
                     weapon_conf = obj_meta.tracker_confidence
                     
                     if owner_id != -1:
                         active_frame_armed_set.add(owner_id)
                         
-                        # Find the corresponding owner's height to determine distance context
+                        # Extract the holding person's height coordinates to assess camera depth
                         owner_idx = np.where(local_ids == owner_id)[0][0]
-                        owner_height = local_boxes[owner_idx][3] # Grab height dimension
+                        owner_height = local_boxes[owner_idx][3] # Index 3 is height
                         
-                        # Update frame accumulation counts
+                        # Increment frame accumulation bounds for specific individual ID
                         current_count = THREAT_HYSTERESIS_TRACKER.get(owner_id, 0) + 1
                         THREAT_HYSTERESIS_TRACKER[owner_id] = current_count
                         
-                        # Determine required verification window based on distance profile
+                        # Enforce higher frame verification verification counts at long distances
                         required_frames = CONFIRMATION_FRAMES_CLOSE
                         env_status = "CLOSE_RANGE"
                         if owner_height < LONG_DIST_HEIGHT_THRESHOLD:
                             required_frames = CONFIRMATION_FRAMES_DISTANT
                             env_status = "LONG_DISTANCE_HIGH_SENSITIVITY"
                         
-                        # --- ESCALATION EVALUATION ---
+                        # If threat breaches frame threshold windows, lock and broadcast alert
                         if current_count >= required_frames:
-                            obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0) # Solid Red Alert Border
-                            obj_meta.text_params.display_text = f"🚨 THREAT CONFIRMED ID {owner_id} [{env_status}]"
+                            obj_meta.rect_params.border_color.set(1.0, 0.0, 1.0, 1.0)  # Magenta Warning Border
+                            obj_meta.text_params.display_text = f"🚨 ARMED THREAT ID: {owner_id} [{env_status}]"
                             
-                            # Fire high-alert telemetry stream payload
+                            # Publish telemetry stream asynchronously with QoS 2
                             producer.client.publish(
                                 "security/analytics/threats", 
                                 json.dumps({
@@ -211,22 +205,20 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
                                 qos=2
                             )
                         else:
-                            # Visual indicator that the system is processing/evaluating a possible threat
-                            obj_meta.rect_params.border_color.set(1.0, 0.64, 0.0, 1.0) # Orange Pending Border
-                            obj_meta.text_params.display_text = f"Analyzing Target ({current_count}/{required_frames})"
-            
-            # Decay loop: If a person is no longer detected with a weapon, clear or reduce their alert score
+                            obj_meta.rect_params.border_color.set(1.0, 0.64, 0.0, 1.0)  # Orange Pending Border
+                            obj_meta.text_params.display_text = f"Analyzing Threat Vector ({current_count}/{required_frames})"
+                    else:
+                        obj_meta.rect_params.border_color.set(0.5, 0.0, 0.5, 1.0)  # Dark Purple Border
+                        obj_meta.text_params.display_text = "⚠️ Unattended Weapon Detected"
+
+            # Decay Loop: Smoothly drop tracking metrics if frames clean up
             for person_id in list(THREAT_HYSTERESIS_TRACKER.keys()):
                 if person_id not in active_frame_armed_set:
-                    # Subtract 2 frames per clean pass to quickly cool down alerts without dropping them instantly on tracking blips
                     new_score = THREAT_HYSTERESIS_TRACKER[person_id] - 2
                     if new_score <= 0:
                         del THREAT_HYSTERESIS_TRACKER[person_id]
                     else:
                         THREAT_HYSTERESIS_TRACKER[person_id] = new_score
-
-        l_frame = l_frame.next
-    return Gst.PadProbeReturn.OK
     
         # ------------------------------------------------------------------
         # FEATURE A: ZERO-COPY GPU FRAME BUFFER CAPTURE
@@ -352,9 +344,7 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
             
     return Gst.PadProbeReturn.OK
 
-
-
-
+@njit(fastmath=True, cache=True)
 def parse_args():
     parser = argparse.ArgumentParser(description="Genetec + DeepStream JIT Pipeline")
     parser.add_argument("--gpu-type", choices=["rtx6000", "rtx50"], required=True, help="rtx6000 or rtx50 toggle")
@@ -411,7 +401,8 @@ def main():
     components = [source, rtppay, parse, nvdec, streammux, pgie, tracker, nvvideo_convert, nvosd, sink]
     for element in components:
         pipeline.add(element)
-
+        
+    @njit(fastmath=True, cache=True)
     def cb_newpad(src, pad, data):
         sink_pad = data.get_static_pad("sink")
         if not sink_pad.is_linked():
