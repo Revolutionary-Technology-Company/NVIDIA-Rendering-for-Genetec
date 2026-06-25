@@ -5,3 +5,6 @@ paddlepaddle-gpu
 layoutparser
 paddleocr
 paho-mqtt
+streamlit
+paho-mqtt
+pandas plotly
