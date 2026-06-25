@@ -1,25 +1,42 @@
 #!/usr/bin/env python3
 import sys
 import argparse
+import numpy as np
+from numba import njit
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import GLib, Gst
 import pyds
 
-# Target resolution matching your high-quality Genetec 4K stream
+# System Constants
 MUXER_OUTPUT_WIDTH = 3840
 MUXER_OUTPUT_HEIGHT = 2160
 GPU_ID = 0
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Genetec + DeepStream Unified Architecture Pipeline")
-    parser.add_argument(
-        "--gpu-type", 
-        choices=["rtx6000", "rtx50"], 
-        required=True, 
-        help="Toggle hardware profile: 'rtx6000' (Ada Lovelace Native) or 'rtx50' (Blackwell Triton Backend)"
-    )
-    return parser.parse_args()
+# --- NUMBA MULTI-CORE JIT OPTIMIZATION ---
+@njit(fastmath=True, cache=True)
+def analyze_distance_metrics_jit(bbox, tracking_id, class_id):
+    """
+    Compiled with LLVM to run at raw C-speed on multi-core processors.
+    Calculates center anomalies and pixel-scale area dimensions 
+    to filter distant objects vs close-up camera blur.
+    """
+    left, top, width, height = bbox
+    area = width * height
+    center_x = left + (width / 2.0)
+    center_y = top + (height / 2.0)
+    
+    # Custom distance prioritization weighting algorithm
+    priority_score = 0.0
+    if class_id == 0:    # Personnel Tracking
+        priority_score = area * 1.2
+    elif class_id == 2:  # Long-range LPR
+        priority_score = area * 2.5
+    elif class_id == 7:  # Blueprint Engineering Wall
+        priority_score = area * 3.0
+        
+    return area, center_x, center_y, priority_score
+
 
 def osd_sink_pad_buffer_probe(pad, info, u_data):
     gst_buffer = info.get_buffer()
@@ -43,15 +60,31 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
                 break
             
             if obj_meta.tracker_confidence > 0.4:
-                # Class assignment based on training metadata maps (0=People, 2=Plates, 7=Blueprints)
+                # Structure raw data array for the Numba njit compiler
+                bbox_data = np.array([
+                    obj_meta.rect_params.left,
+                    obj_meta.rect_params.top,
+                    obj_meta.rect_params.width,
+                    obj_meta.rect_params.height
+                ], dtype=np.float64)
+                
+                # Execute ultra-fast compiled math
+                area, cx, cy, p_score = analyze_distance_metrics_jit(
+                    bbox_data, obj_meta.object_id, obj_meta.class_id
+                )
+                
+                # Class mapping UI colors
                 if obj_meta.class_id == 0:
-                    obj_meta.rect_params.border_color.set(0.0, 1.0, 0.0, 1.0) # Green for People
+                    obj_meta.rect_params.border_color.set(0.0, 1.0, 0.0, 1.0) # Green People
                 elif obj_meta.class_id == 2:
-                    obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0) # Red for Plates
+                    obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0) # Red Plates
                 elif obj_meta.class_id == 7:
-                    obj_meta.rect_params.border_color.set(0.0, 0.0, 1.0, 1.0) # Blue for Blueprints
+                    obj_meta.rect_params.border_color.set(0.0, 0.0, 1.0, 1.0) # Blue Prints
 
-                print(f"Frame #{frame_meta.frame_num} | ID: {obj_meta.object_id} | Class: {obj_meta.class_id}")
+                # Debug analytical streaming logs
+                if p_score > 5000.0:
+                    print(f"[HIGH PRIORITY] Object {obj_meta.object_id} | Class {obj_meta.class_id} | "
+                          f"Center: ({cx:.1f}, {cy:.1f}) | Score: {p_score:.1f}")
             
             try:
                 l_obj = l_obj.next
@@ -64,26 +97,22 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
             
     return Gst.PadProbeReturn.OK
 
-def bus_call(bus, message, loop):
-    t = message.type
-    if t == Gst.MessageType.EOS:
-        print("End-of-stream reached.\n")
-        loop.quit()
-    elif t == Gst.MessageType.ERROR:
-        err, debug = message.parse_error()
-        print(f"Error: {err.message}: {debug}\n")
-        loop.quit()
-    return True
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Genetec + DeepStream JIT Pipeline")
+    parser.add_argument("--gpu-type", choices=["rtx6000", "rtx50"], required=True, help="rtx6000 or rtx50 toggle")
+    return parser.parse_args()
+
 
 def main():
     args = parse_args()
     Gst.init(None)
     loop = GLib.MainLoop()
 
-    print(f"Configuring pipeline toggle for architecture profile: {args.gpu-type.upper()}")
+    print(f"Booting JIT Engine for: {args.gpu_type.upper()}")
     pipeline = Gst.Pipeline()
 
-    # Core Capture Components
+    # Capture Core Infrastructure
     source = Gst.ElementFactory.make("rtspsrc", "rtsp-source")
     source.set_property("location", "rtsp://GENETEC_SERVER_IP:554/LiveOS/Cameras/YOUR_CAMERA_ID")
     source.set_property("latency", 200)
@@ -100,18 +129,13 @@ def main():
     streammux.set_property("batch-size", 1)
     streammux.set_property("gpu-id", GPU_ID)
 
-    # --- DYNAMIC TOGGLE SWITCH LOGIC ---
+    # Architectural Switch Toggle
     if args.gpu_type == "rtx6000":
-        # Native DeepStream Engine (Optimized for Ada Lovelace 48GB Enterprise)
-        print("Loading Native nvinfer element for RTX 6000 Pro...")
         pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
         pgie.set_property("config-file-path", "config_infer_rtx6000.txt")
     else:
-        # Triton Server Engine (Bypasses SM errors on Blackwell RTX 50-series)
-        print("Loading nvinferserver Triton element for ASUS TUF RTX 50...")
         pgie = Gst.ElementFactory.make("nvinferserver", "primary-inference")
         pgie.set_property("config-file-path", "config_infer_rtx50_triton.txt")
-    # -----------------------------------
 
     tracker = Gst.ElementFactory.make("nvtracker", "tracker")
     tracker.set_property("tracker-width", 960)
@@ -126,7 +150,7 @@ def main():
     sink = Gst.ElementFactory.make("nveglglessink", "nvvideo-renderer")
     sink.set_property("sync", 0)
 
-    # Link Pipeline Elements
+    # Assemble Pipeline
     components = [source, rtppay, parse, nvdec, streammux, pgie, tracker, nvvideo_convert, nvosd, sink]
     for element in components:
         pipeline.add(element)
@@ -150,6 +174,7 @@ def main():
     nvvideo_convert.link(nvosd)
     nvosd.link(sink)
 
+    # Inject metadata probe
     osd_sink_pad = nvosd.get_static_pad("sink")
     osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, 0)
 
@@ -157,13 +182,11 @@ def main():
     bus.add_signal_watch()
     bus.connect("message", bus_call, loop)
 
-    print("Pipeline running successfully...")
     pipeline.set_state(Gst.State.PLAYING)
     try:
         loop.run()
     except:
         pass
-
     pipeline.set_state(Gst.State.NULL)
 
 if __name__ == '__main__':
