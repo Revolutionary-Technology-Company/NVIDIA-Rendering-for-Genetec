@@ -1,0 +1,14 @@
+[property]
+gpu-id=0
+config_backend_type=1
+infer_config {
+  unique_id: 1
+  backend {
+    triton {
+      model_name: "yolov8x_blackwell"
+      model_repo {
+        root_dir: "./triton_model_repo"
+      }
+    }
+  }
+}
