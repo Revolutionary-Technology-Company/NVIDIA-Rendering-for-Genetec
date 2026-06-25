@@ -13,6 +13,26 @@ MUXER_OUTPUT_WIDTH = 3840
 MUXER_OUTPUT_HEIGHT = 2160
 GPU_ID = 0
 
+import yolov8_triton_parser as parser
+
+# Inside your deepstream pad probe function:
+# 1. Extract raw tensor layer array from nvinferserver metadata
+raw_array = get_raw_tensor_from_meta(frame_meta) # Shape: [1, 84, 8400]
+
+# 2. Decode matrix instantly with your Numba multi-core parser
+boxes, scores, class_ids = parser.triton_output_to_objects(
+    raw_array, 
+    conf_thresh=0.50, 
+    iou_thresh=0.45, 
+    num_classes=80
+)
+
+# 3. Boxes now contains precise [x1, y1, x2, y2] metrics 
+# Feed these directly to your OCR module for license plates or blueprint reading
+for i in range(len(boxes)):
+    print(f"Detected Class {class_ids[i]} at {boxes[i]} with conf {scores[i]:.2f}")
+
+
 # --- NUMBA MULTI-CORE JIT OPTIMIZATION ---
 @njit(fastmath=True, cache=True)
 def analyze_distance_metrics_jit(bbox, tracking_id, class_id):
@@ -38,64 +58,55 @@ def analyze_distance_metrics_jit(bbox, tracking_id, class_id):
     return area, center_x, center_y, priority_score
 
 
+import pyds
+import yolov8_triton_parser as parser
+import ocr_layer as ocr
+
 def osd_sink_pad_buffer_probe(pad, info, u_data):
     gst_buffer = info.get_buffer()
     if not gst_buffer:
         return Gst.PadProbeReturn.OK
 
+    # 1. Retrieve the native DeepStream batch metadata context
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     l_frame = batch_meta.frame_meta_list
     
     while l_frame is not None:
-        try:
-            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
-        except StopIteration:
-            break
-
-        l_obj = frame_meta.obj_meta_list
-        while l_obj is not None:
-            try:
-                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-            except StopIteration:
-                break
+        frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        
+        # ------------------------------------------------------------------
+        # NEW: Intercept the GPU Frame Buffer Array for Surface Cropping
+        # ------------------------------------------------------------------
+        # Map the underlying hardware memory buffer directly into Python space
+        surface_transformer = pyds.get_nvds_Layer_Array(hash(gst_buffer), frame_meta.frame_num)
+        frame_rgba = np.array(surface_transformer, copy=False, order='C')
+        
+        # Extract the raw Triton inference output layer from metadata structures
+        raw_triton_tensor = get_raw_tensor_from_meta(frame_meta) 
+        
+        # 2. Run your fast JIT Numba parser & NMS module to extract clean coordinates
+        final_boxes, final_scores, final_class_ids = parser.triton_output_to_objects(
+            raw_triton_tensor, conf_thresh=0.50, iou_thresh=0.45, num_classes=80
+        )
+        
+        # 3. Call your new Custom OCR Layer script
+        active_plates = ocr.process_license_plates_ocr(frame_rgba, final_boxes, final_class_ids)
+        
+        # 4. Use or transmit the extracted data
+        for plate in active_plates:
+            print(f"[PLATE CAPTURED] Read: {plate['text']} | Confidence: {plate['confidence']:.2f}%")
             
-            if obj_meta.tracker_confidence > 0.4:
-                # Structure raw data array for the Numba njit compiler
-                bbox_data = np.array([
-                    obj_meta.rect_params.left,
-                    obj_meta.rect_params.top,
-                    obj_meta.rect_params.width,
-                    obj_meta.rect_params.height
-                ], dtype=np.float64)
-                
-                # Execute ultra-fast compiled math
-                area, cx, cy, p_score = analyze_distance_metrics_jit(
-                    bbox_data, obj_meta.object_id, obj_meta.class_id
-                )
-                
-                # Class mapping UI colors
-                if obj_meta.class_id == 0:
-                    obj_meta.rect_params.border_color.set(0.0, 1.0, 0.0, 1.0) # Green People
-                elif obj_meta.class_id == 2:
-                    obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0) # Red Plates
-                elif obj_meta.class_id == 7:
-                    obj_meta.rect_params.border_color.set(0.0, 0.0, 1.0, 1.0) # Blue Prints
-
-                # Debug analytical streaming logs
-                if p_score > 5000.0:
-                    print(f"[HIGH PRIORITY] Object {obj_meta.object_id} | Class {obj_meta.class_id} | "
-                          f"Center: ({cx:.1f}, {cy:.1f}) | Score: {p_score:.1f}")
+            # (Optional) Inject the text back into the DeepStream UI Display overlay
+            txt_params = pyds.nvds_acquire_user_meta_from_pool(batch_meta)
+            # Configure visual text mapping above the vehicle bounding box...
             
-            try:
-                l_obj = l_obj.next
-            except StopIteration:
-                break
         try:
             l_frame = l_frame.next
         except StopIteration:
             break
             
     return Gst.PadProbeReturn.OK
+
 
 
 def parse_args():
