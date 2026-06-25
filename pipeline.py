@@ -386,7 +386,8 @@ def main():
     streammux = Gst.ElementFactory.make("nvstreammux", "stream-multiplexer")
     streammux.set_property("width", MUXER_OUTPUT_WIDTH)
     streammux.set_property("height", MUXER_OUTPUT_HEIGHT)
-    streammux.set_property("batch-size", 1)
+    streammux.set_property("batch-size", 4)
+    streammux.set_property("batched-push-timeout", 33000)
     streammux.set_property("gpu-id", GPU_ID)
 
     # Architectural Switch Toggle
