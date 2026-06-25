@@ -67,12 +67,22 @@ producer.boot_client()
 
 CAMERA_IDENTIFIER = "ENGINEERING_ROOM_CAM_01"
 
+# State history dictionary to track threats over sequential frames
+# Format: { person_id: consecutive_frame_count }
+THREAT_HYSTERESIS_TRACKER = {}
+
+# Sensitivity Tuning Parameters based on camera distance profiles
+LONG_DIST_HEIGHT_THRESHOLD = 300.0 # Pixels in 4K space
+CONFIRMATION_FRAMES_CLOSE = 3      # Fast alert if close up (3 frames ~0.1s)
+CONFIRMATION_FRAMES_DISTANT = 8    # More verification frames required at long-distance to kill false positives
+
 def osd_sink_pad_buffer_probe(pad, info, u_data):
     """
     Unified Production Metadata Probe: Handles JIT optimization,
     NVIDIA hardware frame access, personnel tracking, long-distance LPR,
     and engineering room blueprint matrix evaluation simultaneously.
     """
+    global THREAT_HYSTERESIS_TRACKER
     gst_buffer = info.get_buffer()
     if not gst_buffer:
         print("Unable to grab GstBuffer frame stream.")
@@ -150,6 +160,74 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
                     else:
                         obj_meta.text_params.display_text = "WARNING: Unattended Weapon Detected"
 
+        if obj_count > 0:
+            # Run the new distance-adaptive proximity math script
+            assigned_owners = parser.evaluate_threat_proximity_jit(local_boxes, local_classes, local_ids)
+            
+            # Create a set of all people confirmed armed on THIS specific frame pass
+            active_frame_armed_set = set()
+            
+            for i in range(obj_count):
+                obj_meta = meta_references[i]
+                
+                if obj_meta.class_id == 3:  # Weapon box evaluations
+                    owner_id = assigned_owners[i]
+                    weapon_conf = obj_meta.tracker_confidence
+                    
+                    if owner_id != -1:
+                        active_frame_armed_set.add(owner_id)
+                        
+                        # Find the corresponding owner's height to determine distance context
+                        owner_idx = np.where(local_ids == owner_id)[0][0]
+                        owner_height = local_boxes[owner_idx][3] # Grab height dimension
+                        
+                        # Update frame accumulation counts
+                        current_count = THREAT_HYSTERESIS_TRACKER.get(owner_id, 0) + 1
+                        THREAT_HYSTERESIS_TRACKER[owner_id] = current_count
+                        
+                        # Determine required verification window based on distance profile
+                        required_frames = CONFIRMATION_FRAMES_CLOSE
+                        env_status = "CLOSE_RANGE"
+                        if owner_height < LONG_DIST_HEIGHT_THRESHOLD:
+                            required_frames = CONFIRMATION_FRAMES_DISTANT
+                            env_status = "LONG_DISTANCE_HIGH_SENSITIVITY"
+                        
+                        # --- ESCALATION EVALUATION ---
+                        if current_count >= required_frames:
+                            obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0) # Solid Red Alert Border
+                            obj_meta.text_params.display_text = f"🚨 THREAT CONFIRMED ID {owner_id} [{env_status}]"
+                            
+                            # Fire high-alert telemetry stream payload
+                            producer.client.publish(
+                                "security/analytics/threats", 
+                                json.dumps({
+                                    "timestamp": time.time(),
+                                    "camera": CAMERA_IDENTIFIER, 
+                                    "alert": "ARMED_INDIVIDUAL", 
+                                    "person_id": int(owner_id),
+                                    "environment": env_status,
+                                    "confidence": float(weapon_conf)
+                                }),
+                                qos=2
+                            )
+                        else:
+                            # Visual indicator that the system is processing/evaluating a possible threat
+                            obj_meta.rect_params.border_color.set(1.0, 0.64, 0.0, 1.0) # Orange Pending Border
+                            obj_meta.text_params.display_text = f"Analyzing Target ({current_count}/{required_frames})"
+            
+            # Decay loop: If a person is no longer detected with a weapon, clear or reduce their alert score
+            for person_id in list(THREAT_HYSTERESIS_TRACKER.keys()):
+                if person_id not in active_frame_armed_set:
+                    # Subtract 2 frames per clean pass to quickly cool down alerts without dropping them instantly on tracking blips
+                    new_score = THREAT_HYSTERESIS_TRACKER[person_id] - 2
+                    if new_score <= 0:
+                        del THREAT_HYSTERESIS_TRACKER[person_id]
+                    else:
+                        THREAT_HYSTERESIS_TRACKER[person_id] = new_score
+
+        l_frame = l_frame.next
+    return Gst.PadProbeReturn.OK
+    
         # ------------------------------------------------------------------
         # FEATURE A: ZERO-COPY GPU FRAME BUFFER CAPTURE
         # ------------------------------------------------------------------
