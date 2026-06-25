@@ -63,8 +63,14 @@ import yolov8_triton_parser as parser
 import ocr_layer as ocr
 
 def osd_sink_pad_buffer_probe(pad, info, u_data):
+    """
+    Unified Production Metadata Probe: Handles JIT optimization,
+    NVIDIA hardware frame access, personnel tracking, long-distance LPR,
+    and engineering room blueprint matrix evaluation simultaneously.
+    """
     gst_buffer = info.get_buffer()
     if not gst_buffer:
+        print("Unable to grab GstBuffer frame stream.")
         return Gst.PadProbeReturn.OK
 
     # 1. Retrieve the native DeepStream batch metadata context
@@ -72,40 +78,125 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
     l_frame = batch_meta.frame_meta_list
     
     while l_frame is not None:
-        frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
-        
+        try:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
+
         # ------------------------------------------------------------------
-        # NEW: Intercept the GPU Frame Buffer Array for Surface Cropping
+        # FEATURE A: ZERO-COPY GPU FRAME BUFFER CAPTURE
         # ------------------------------------------------------------------
-        # Map the underlying hardware memory buffer directly into Python space
-        surface_transformer = pyds.get_nvds_Layer_Array(hash(gst_buffer), frame_meta.frame_num)
-        frame_rgba = np.array(surface_transformer, copy=False, order='C')
-        
-        # Extract the raw Triton inference output layer from metadata structures
+        # Map the active hardware memory block directly within GPU VRAM lanes.
+        # This allows PaddleOCR to run without copying frames back to CPU RAM.
+        try:
+            surface_transformer = pyds.get_nvds_Layer_Array(hash(gst_buffer), frame_meta.frame_num)
+            frame_rgba = np.array(surface_transformer, copy=False, order='C')
+        except Exception as e:
+            print(f"Warning: Frame buffer surface mapping skipped: {str(e)}")
+            frame_rgba = None
+
+        # ------------------------------------------------------------------
+        # FEATURE B: JIT MULTI-CORE MATRIX DECODING & TRITON PARSING
+        # ------------------------------------------------------------------
+        # Fetch the raw tensor memory array emitted by Triton/nvinfer
+        # (Assuming custom user meta tensor attachments or deepstream structures)
         raw_triton_tensor = get_raw_tensor_from_meta(frame_meta) 
         
-        # 2. Run your fast JIT Numba parser & NMS module to extract clean coordinates
+        # Pass the matrix into the multi-threaded Numba parser compiled with C-speed
         final_boxes, final_scores, final_class_ids = parser.triton_output_to_objects(
-            raw_triton_tensor, conf_thresh=0.50, iou_thresh=0.45, num_classes=80
+            raw_triton_tensor, conf_thresh=0.45, iou_thresh=0.45, num_classes=80
         )
-        
-        # 3. Call your new Custom OCR Layer script
-        active_plates = ocr.process_license_plates_ocr(frame_rgba, final_boxes, final_class_ids)
-        
-        # 4. Use or transmit the extracted data
-        for plate in active_plates:
-            print(f"[PLATE CAPTURED] Read: {plate['text']} | Confidence: {plate['confidence']:.2f}%")
+
+        # ------------------------------------------------------------------
+        # FEATURE C: SECURE ASYNCHRONOUS LICENSE PLATE CHARACTER OCR
+        # ------------------------------------------------------------------
+        if frame_rgba is not None:
+            # Process the RGBA frame matrix specifically looking for Class 2 (Plates)
+            captured_plates = ocr.process_license_plates_ocr(frame_rgba, final_boxes, final_class_ids)
             
-            # (Optional) Inject the text back into the DeepStream UI Display overlay
-            txt_params = pyds.nvds_acquire_user_meta_from_pool(batch_meta)
-            # Configure visual text mapping above the vehicle bounding box...
+            for plate in captured_plates:
+                px1, py1, px2, py2 = plate['coords']
+                print(f"[LPR CAPTURE] Plate text: {plate['text']} | Accuracy: {plate['confidence']:.2f}%")
+                
+                # Dynamic On-Screen Display Text Construction over the car/plate
+                txt_params = pyds.nvds_acquire_user_meta_from_pool(batch_meta)
+                display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+                display_meta.num_labels = 1
+                
+                label = display_meta.text_params[0]
+                label.display_text = f"PLATE: {plate['text']} ({plate['confidence']*100:.0f}%)"
+                label.x_offset = px1
+                label.y_offset = max(10, py1 - 25)
+                label.font_params.font_name = "Serif"
+                label.font_params.font_size = 14
+                label.font_params.font_color.set(1.0, 1.0, 1.0, 1.0) # White Text
+                label.set_bg_clr = 1
+                label.text_bg_clr.set(0.0, 0.0, 0.0, 0.8)            # Semi-transparent black background
+                pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
+        # ------------------------------------------------------------------
+        # FEATURE D: GENETEC METADATA DISPLAY, COLOR ENCODING & VISUALS
+        # ------------------------------------------------------------------
+        # Cycle through objects tracked on the frame to apply your UI rule constraints
+        l_obj = frame_meta.obj_meta_list
+        while l_obj is not None:
+            try:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
             
+            # Distance Quality Parameter: Reject shaky tracking anchors
+            if obj_meta.tracker_confidence > 0.40:
+                
+                # Package coordinates into an array for quick multi-core math evaluation
+                bbox_data = np.array([
+                    obj_meta.rect_params.left,
+                    obj_meta.rect_params.top,
+                    obj_meta.rect_params.width,
+                    obj_meta.rect_params.height
+                ], dtype=np.float64)
+                
+                # Execute compiled distance prioritizing logic
+                area, cx, cy, priority_score = analyze_distance_metrics_jit(
+                    bbox_data, obj_meta.object_id, obj_meta.class_id
+                )
+                
+                # Priority Level 1: Personnel Tracking (Class 0)
+                if obj_meta.class_id == 0:
+                    obj_meta.rect_params.border_color.set(0.0, 1.0, 0.0, 1.0)  # Solid Green
+                    obj_meta.text_params.display_text = f"Staff ID:{obj_meta.object_id} [Conf:{obj_meta.tracker_confidence:.2f}]"
+                    
+                # Priority Level 2: Long-Range Vehicle/Plate Anchors (Class 2)
+                elif obj_meta.class_id == 2:
+                    obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0)  # Bright Red Border
+                    
+                # Priority Level 3: Wall Blueprint Reading from Engineering Room (Class 7)
+                elif obj_meta.class_id == 7:
+                    obj_meta.rect_params.border_color.set(0.0, 0.0, 1.0, 1.0)  # Deep Blue Border
+                    obj_meta.text_params.display_text = f"ENG BLUEPRINT | Scale Area: {area:.0f}px"
+                    
+                    # Optional: Forward blueprint coordinates to OCR if textual reading is required
+                    if frame_rgba is not None:
+                        # Extract blueprint text blocks here using structural croppers 
+                        pass
+
+                # Print clean, actionable engineering logs for Git repo ingestion
+                if priority_score > 6000.0 or obj_meta.class_id == 7:
+                    print(f"[METRIC LOG] Frame #{frame_meta.frame_num} | Track ID: {obj_meta.object_id} | "
+                          f"Class: {obj_meta.class_id} | Center: ({cx:.0f}, {cy:.0f}) | P-Score: {priority_score:.1f}")
+
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
+                
         try:
             l_frame = l_frame.next
         except StopIteration:
             break
             
     return Gst.PadProbeReturn.OK
+
 
 
 
