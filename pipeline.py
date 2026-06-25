@@ -88,6 +88,68 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
         except StopIteration:
             break
 
+        # 1. Fetch JIT deep learning bounding boxes from the Triton backend
+        raw_triton_tensor = get_raw_tensor_from_meta(frame_meta) 
+        final_boxes, final_scores, final_class_ids = parser.triton_output_to_objects(
+            raw_triton_tensor, conf_thresh=0.45, iou_thresh=0.45, num_classes=80
+        )
+
+        # 2. Synchronize DeepStream Tracker Objects into local flat arrays for JIT math
+        obj_count = 0
+        l_obj = frame_meta.obj_meta_list
+        # Determine active object counts
+        while l_obj is not None:
+            obj_count += 1
+            l_obj = l_obj.next
+            
+        local_boxes = np.zeros((obj_count, 4), dtype=np.float64)
+        local_classes = np.zeros(obj_count, dtype=np.int32)
+        local_ids = np.zeros(obj_count, dtype=np.int32)
+        meta_references = []
+
+        # Populate arrays from the DeepStream object metadata list
+        idx = 0
+        l_obj = frame_meta.obj_meta_list
+        while l_obj is not None:
+            obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            local_boxes[idx] = [obj_meta.rect_params.left, obj_meta.rect_params.top, 
+                                obj_meta.rect_params.width, obj_meta.rect_params.height]
+            local_classes[idx] = obj_meta.class_id
+            local_ids[idx] = obj_meta.object_id
+            meta_references.append(obj_meta)
+            idx += 1
+            l_obj = l_obj.next
+
+        # 3. RUN WEAPON PROXIMITY EVALUATION VIA MULTI-CORE JIT
+        if obj_count > 0:
+            assigned_owners = parser.evaluate_threat_proximity_jit(local_boxes, local_classes, local_ids)
+            
+            # 4. Apply Visual Overlays and Trigger Alerts based on Proximity Output
+            for i in range(obj_count):
+                obj_meta = meta_references[i]
+                
+                # Class 0: Personnel Tracking
+                if obj_meta.class_id == 0:
+                    obj_meta.rect_params.border_color.set(0.0, 1.0, 0.0, 1.0) # Green
+                    obj_meta.text_params.display_text = f"Person ID: {obj_meta.object_id}"
+                    
+                # Class 3: Weapon / Firearm Tracking
+                elif obj_meta.class_id == 3:
+                    # Apply a Solid Magenta/Purple alert border for visibility in the engineering room
+                    obj_meta.rect_params.border_color.set(1.0, 0.0, 1.0, 1.0) 
+                    owner_id = assigned_owners[i]
+                    
+                    if owner_id != -1:
+                        obj_meta.text_params.display_text = f"CRITICAL: Weapon Held by ID {owner_id}"
+                        # Instantly broadcast a high-priority payload over MQTT
+                        producer.client.publish(
+                            "security/analytics/threats", 
+                            json.dumps({"camera": CAMERA_IDENTIFIER, "alert": "ARMED_INDIVIDUAL", "person_id": int(owner_id)}),
+                            qos=2 # QoS 2 ensures the security station receives the message exactly once
+                        )
+                    else:
+                        obj_meta.text_params.display_text = "WARNING: Unattended Weapon Detected"
+
         # ------------------------------------------------------------------
         # FEATURE A: ZERO-COPY GPU FRAME BUFFER CAPTURE
         # ------------------------------------------------------------------
