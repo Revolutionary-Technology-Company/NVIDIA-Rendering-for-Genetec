@@ -4,3 +4,4 @@ paddleocr
 paddlepaddle-gpu
 layoutparser
 paddleocr
+paho-mqtt
