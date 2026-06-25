@@ -1,6 +1,11 @@
 name: "yolov8x_blackwell"
 platform: "tensorrt_plan"
-max_batch_size: 4
+
+# 1. MAX BATCH SIZE SCALING
+# Sets the absolute upper limit for the dynamic batching engine.
+# - For 16GB/32GB RTX 50-Series cards, '8' balances VRAM overhead.
+# - For 48GB RTX 6000 Pro rigs processing 10+ streams, this can scale to '16'.
+max_batch_size: 8
 
 input [
   {
@@ -18,14 +23,36 @@ output [
   }
 ]
 
+# 2. DYNAMIC BATCHING SCHEDULER
+# This block intercepts single, distinct camera streams arriving on different threads 
+# and packages them into unified execution batches.
+dynamic_batching {
+  # Controls which batch sizes Triton prefers to execute.
+  # Sub-batches (e.g., 2 or 4) can still run instantly if the timeout expires.
+  preferred_batch_size: [ 2, 4, 8 ]
+  
+  # MAX QUEUE DELAY (In Microseconds)
+  # The maximum time Triton will wait to collect frames to form a preferred batch size.
+  # 5000 microseconds = 5ms. At 30 FPS, a frame arrives every 33.3ms. 
+  # A 5ms delay allows multiple camera streams to group up without introducing human-perceptible lag.
+  max_queue_delay_microseconds: 5000
+}
+
+# 3. CONCURRENT MODEL INSTANCES (GPU Parallelization)
+# Creates multiple independent execution engines inside your GPU VRAM lanes.
 instance_group [
   {
-    count: 1
+    # Adjust count based on your specific GPU target profile:
+    # - ASUS TUF RTX 5070/5080 (16GB VRAM): Set count to 1 (prevents Out-Of-Memory/OOM crashes).
+    # - ASUS TUF RTX 5090 (32GB VRAM): Set count to 2.
+    # - NVIDIA RTX 6000 Pro (48GB ECC VRAM): Set count to 3 or 4 to process maximum parallel channels.
+    count: 2
     kind: KIND_GPU
     gpus: [ 0 ]
   }
 ]
 
+# 4. TENSORRT CONTEXT OPTIMIZATIONS
 optimization {
   execution_accelerators {
     gpu_execution_accelerator [
@@ -34,6 +61,10 @@ optimization {
         parameters {
           key: "precision_mode"
           value: "FP16"
+        }
+        parameters {
+          key: "gpu_memory_utilization"
+          value: "0.85" # Leaves 15% VRAM headroom for PaddleOCR canvas croppers
         }
       }
     ]
