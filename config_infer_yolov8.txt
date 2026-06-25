@@ -1,0 +1,13 @@
+[property]
+gpu-id=0
+net-scale-factor=0.003921569790691137
+model-engine-file=model_b1_gpu0_fp16.engine
+onnx-file=yolov8x.onnx
+# 3840x2160 native model inference maintains long-distance feature readability
+infer-dims=3;2160;3840
+num-detected-classes=80
+interval=0
+gie-unique-id=1
+network-mode=1 # 1 = FP16 Precision for Tensor Cores, 0 = FP32
+network-type=0
+cluster-mode=2 # 2 = OpenCV GroupRectangles, 4 = DCS
