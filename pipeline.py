@@ -7,6 +7,9 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import GLib, Gst
 import pyds
+import yolov8_triton_parser as parser
+import ocr_layer as ocr
+import blueprint_reader as blueprint  # Import your new module
 
 # System Constants
 MUXER_OUTPUT_WIDTH = 3840
@@ -56,11 +59,6 @@ def analyze_distance_metrics_jit(bbox, tracking_id, class_id):
         priority_score = area * 3.0
         
     return area, center_x, center_y, priority_score
-
-
-import pyds
-import yolov8_triton_parser as parser
-import ocr_layer as ocr
 
 def osd_sink_pad_buffer_probe(pad, info, u_data):
     """
@@ -133,6 +131,16 @@ def osd_sink_pad_buffer_probe(pad, info, u_data):
                 label.set_bg_clr = 1
                 label.text_bg_clr.set(0.0, 0.0, 0.0, 0.8)            # Semi-transparent black background
                 pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
+        # --------------------------------------------------------------
+        # RUN FEATURE 2: WALL BLUEPRINT STRUCTURAL READER
+        # --------------------------------------------------------------
+        blueprints_read = blueprint.process_engineering_blueprint(frame_rgba, final_boxes, final_class_ids)
+        for bp in blueprints_read:
+            print(f"\n--- [BLUEPRINT READ SUCCESS: ID {bp['blueprint_id']}] ---")
+            for line in bp['data_payload']:
+                print(f" > Extracted Label: {line['text']} (Conf: {line['score']:.2f})")
+            print("--------------------------------------------------\n")
 
         # ------------------------------------------------------------------
         # FEATURE D: GENETEC METADATA DISPLAY, COLOR ENCODING & VISUALS
